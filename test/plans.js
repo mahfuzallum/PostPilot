@@ -1,0 +1,106 @@
+// Plan modal endpoints, pause/resume (auto via worker), temporary premium auto-revert, country flag helper.
+const os = require('os'), fs = require('fs'), path = require('path'), assert = require('assert');
+process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ppp-'));
+for (const k of ['ADMIN_PATH', 'SMTP_HOST', 'SMTP_USER', 'SMTP_PASS']) delete process.env[k];
+process.env.GEOIP_LOOKUP = 'off';
+const app = require('../src/server');
+const { db } = require('../src/db');
+const P = require('../src/payments');
+const W = require('../src/worker');
+const F = require('../src/flags');
+let pass = 0; const ok = (c, m) => { assert.ok(c, m); pass++; console.log('  ✔', m); };
+const DAY = 864e5, U = id => db.prepare('SELECT * FROM users WHERE id=?').get(id), day = t => new Date(t).toISOString().slice(0, 10);
+const plog = (id, a) => db.prepare('SELECT * FROM plan_log WHERE user_id=? AND action=? ORDER BY id DESC').get(id, a);
+const alog = (a, id) => db.prepare('SELECT 1 FROM audit_log WHERE action=? AND target=?').get(a, 'user#' + id);
+(async () => {
+  console.log('Flag helper');
+  ok(F.flagEmoji('BD') === '🇧🇩' && F.flagEmoji('us') === '🇺🇸' && F.flagEmoji('GB') === '🇬🇧', 'ISO code -> regional indicator flag');
+  ok(F.flagEmoji(null) === '🌐' && F.flagEmoji('XX') === '🌐' && F.flagEmoji('Unknown') === '🌐' && F.flagEmoji('1A') === '🌐', 'unknown / invalid -> globe');
+  ok(F.countryName('BD') === 'Bangladesh' && F.countryName('') === 'Unknown', 'country names');
+  ok(/🇧🇩<\/span> <span title="BD">Bangladesh/.test(F.flagLabel('BD')) && F.flagLabel(null).includes('🌐'), 'flag label = flag + name');
+
+  const srv = app.listen(0), base = `http://127.0.0.1:${srv.address().port}`, jars = {};
+  const f = async (u, o = {}, j = 'u') => { const r = await fetch(base + u, { redirect: 'manual', ...o, headers: { ...(o.headers || {}), cookie: jars[j] || '' } }); const sc = r.headers.get('set-cookie'); if (sc) jars[j] = sc.split(';')[0]; return r; };
+  const form = o => ({ method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(o).toString() });
+  await f('/signup', form({ email: 'plan@example.com', password: 'password123' }));
+  const id = db.prepare("SELECT id FROM users WHERE email='plan@example.com'").get().id;
+  db.prepare("UPDATE users SET last_country='BD', last_ip='203.0.113.9' WHERE id=?").run(id);
+  const OP = require('../src/owner').adminPath();
+  ok((await f(OP + `/users/${id}/plan?partial=1`, {}, 'o')).status === 404, 'modal endpoint 404 when logged out');
+  await f(OP + '/setup', form({ username: 'boss', password: 'correct-horse-9' }), 'o');
+
+  console.log('Plan modal');
+  const part = await (await f(OP + `/users/${id}/plan?partial=1`, {}, 'o')).text();
+  ok(/data-pm/.test(part) && !/<html/.test(part) && !/<script/i.test(part), 'partial returns the modal fragment only, no scripts');
+  ok(['monthly', 'quarterly', 'semiannual', 'yearly', 'custom'].every(k => part.includes(`value="${k}"`)) && /\$7<\/b>/.test(part) && /\$16<\/b>/.test(part) && /\$30<\/b>/.test(part) && /\$50<\/b>/.test(part), 'plan cards $7/$16/$30/$50 + Custom');
+  ok(/name="start" value="\d{4}-\d\d-\d\d"/.test(part) && /name="end" value="\d{4}-\d\d-\d\d"/.test(part) && /name="note"/.test(part) && /name="amount"/.test(part), 'start/expiry prefilled, amount + note');
+  ok(part.includes('🇧🇩') && part.includes('Bangladesh'), 'modal shows flag');
+  const full = await (await f(OP + `/users/${id}/plan?tab=pause`, {}, 'o')).text();
+  ok(/<html/.test(full) && /data-pane="pause" >/.test(full) && /data-pane="plan" hidden/.test(full) && !/<script(?![^>]*src=)/i.test(full), 'no-JS full page with the chosen tab');
+  const users = await (await f(OP + '/users', {}, 'o')).text();
+  ok(users.includes(`href="${OP}/users/${id}/plan" data-modal`) && !/name="start" type="date"/.test(users), 'plan cell opens the modal; old inline grant form gone');
+  ok(/🇧🇩<\/span> <span title="BD">Bangladesh/.test(users), 'users table shows flag + country name');
+  { const prof = await (await f(OP + `/users/${id}`, {}, 'o')).text();
+    ok(/class="prof-acts"[\s\S]*Actions ▾/.test(prof), 'profile page has an Actions menu');
+    ok([`/users/${id}/plan" data-modal data-act="plan"`, `/users/${id}/plan?tab=pause" data-modal data-act="pause"`, `/users/${id}/plan?tab=temp" data-modal data-act="temp"`].every(x => prof.includes(x)), 'profile Actions -> Plan / Pause / Temporary all open the modal');
+    const pages = [users, prof, await (await f(OP, {}, 'o')).text(), await (await f(OP + '/activity', {}, 'o')).text()];
+    ok(pages.every(pg => !/action="[^"]*\/grant"/.test(pg) && !/name="start" type="date"/.test(pg) && !/href="[^"]*#(plan|grant)[^"]*"/.test(pg)), 'no inline / anchor-scroll plan panels on any owner page');
+    ok(pages.every(pg => (pg.match(/href="[^"]*\/users\/\d+\/plan[^"]*"(?! data-modal)/g) || []).length === 0), 'every plan link carries data-modal'); }
+
+  const s0 = Date.parse('2026-12-01T00:00:00Z');
+  await f(OP + `/users/${id}/plan-save`, form({ plan: 'quarterly', start: '2026-12-01', end: '2027-03-15', amount: '16', source: 'manual', note: 'bKash ref 42' }), 'o');
+  let u = U(id), led = db.prepare('SELECT * FROM payments_ledger WHERE user_id=? ORDER BY id DESC').get(id);
+  ok(u.plan === 'quarterly' && u.plan_until === Date.parse('2027-03-15T00:00:00Z') && led.amount === 16 && led.note === 'bKash ref 42', 'save: plan + edited expiry + amount + note in ledger');
+  ok(db.prepare('SELECT start_at FROM subscriptions WHERE user_id=? ORDER BY id DESC').get(id).start_at === s0 && alog('plan.grant', id), 'save: subscription start + audit');
+  await f(OP + `/users/${id}/plan-save`, form({ plan: 'custom', start: day(Date.now()), end: day(Date.now() + 20 * DAY), amount: '5' }), 'o');
+  u = U(id); ok(u.plan === 'custom' && P.isPremium(u) && Math.round((u.plan_until - Date.now()) / DAY) <= 20, 'custom plan with chosen expiry');
+  const before = db.prepare('SELECT COUNT(*) c FROM payments_ledger').get().c;
+  await f(OP + `/users/${id}/plan-save`, form({ plan: 'monthly', start: '2027-01-10', end: '2027-01-01' }), 'o');
+  ok(db.prepare('SELECT COUNT(*) c FROM payments_ledger').get().c === before, 'expiry before start is rejected');
+
+  console.log('Pause / resume');
+  const until0 = U(id).plan_until;
+  await f(OP + `/users/${id}/pause`, form({ dur: '7', extend: '1' }), 'o');
+  u = U(id); ok(P.isPaused(u) && !P.isPremium(u) && Math.abs(u.paused_until - (Date.now() + 7 * DAY)) < 5000 && alog('plan.pause', id), 'pause 7 days: premium OFF + audit');
+  const lst = await (await f(OP + '/users?f=paused', {}, 'o')).text();
+  ok(lst.includes('plan@example.com') && /⏸ Paused until [A-Z][a-z]{2} \d+/.test(lst) && /Paused<em>1<\/em>/.test(lst), 'Paused filter tab + "Paused until" badge');
+  await f('/login', form({ email: 'plan@example.com', password: 'password123' }));
+  const bill = await (await f('/billing')).text();
+  ok(/Your plan is paused until/.test(bill), 'billing page: "Your plan is paused until …"');
+  // simulate time passing: pause started 7 days ago and ended now
+  db.prepare('UPDATE users SET paused_at=?, paused_until=? WHERE id=?').run(Date.now() - 7 * DAY, Date.now() - 1000, id);
+  await W.tick();
+  u = U(id); ok(!u.paused_at && P.isPremium(u), 'worker auto-resumes at the end of the pause');
+  ok(Math.abs(u.plan_until - (until0 + 7 * DAY)) < 5000 && plog(id, 'auto_resume'), 'expiry extended by paused days + history entry');
+  await f(OP + `/users/${id}/pause`, form({ dur: 'forever' }), 'o');
+  u = U(id); ok(P.isPaused(u) && !u.paused_until, 'pause indefinitely');
+  await W.tick(); ok(P.isPaused(U(id)), 'indefinite pause is not auto-resumed');
+  const ut = U(id).plan_until;
+  await f(OP + `/users/${id}/resume`, {method:'POST'}, 'o');
+  u = U(id); ok(!u.paused_at && P.isPremium(u) && u.plan_until === ut && alog('plan.resume', id), 'manual resume without extend keeps expiry');
+  await f(OP + `/users/${id}/pause`, form({ dur: 'date', until: day(Date.now() + 3 * DAY) }), 'o');
+  ok(day(U(id).paused_until) === day(Date.now() + 3 * DAY), 'pause until a date');
+  await f(OP + `/users/${id}/resume`, {method:'POST'}, 'o');
+
+  console.log('Temporary premium');
+  await f(OP + `/users/${id}/revoke`, {method:'POST'}, 'o');
+  ok(!P.isPremium(U(id)), 'revoked -> free');
+  await f(OP + `/users/${id}/temp`, form({ dur: '3' }), 'o');
+  u = U(id); ok(P.isPremium(u) && P.hasTemp(u) && u.plan === 'free' && alog('plan.temp_on', id), 'temporary premium ON (no paid plan, no ledger row)');
+  const lt = await (await f(OP + '/users?q=plan%40', {}, 'o')).text();
+  ok(/⏱ Temporary until [A-Z][a-z]{2} \d+/.test(lt), '"Temporary until" badge in table');
+  ok(/Temporary Premium is on until/.test(await (await f('/billing')).text()), 'billing shows temporary premium');
+  db.prepare('UPDATE users SET temp_until=? WHERE id=?').run(Date.now() - 1000, id);
+  ok(!P.isPremium(U(id)), 'reverts as soon as the time is up');
+  await W.tick();
+  u = U(id); ok(!u.temp_until && plog(id, 'temp_auto_end') && db.prepare("SELECT 1 FROM audit_log WHERE action='plan.housekeeping'").get(), 'worker clears it + history + audit');
+  await f(OP + `/users/${id}/temp`, form({ dur: '30' }), 'o'); await f(OP + `/users/${id}/temp-end`, {method:'POST'}, 'o');
+  ok(!P.hasTemp(U(id)) && alog('plan.temp_off', id), 'end temporary premium now');
+  ok(U(id).disabled === 0 && U(id).push_enabled !== 0, 'separate from ban and push');
+  db.prepare("UPDATE users SET last_country='BD' WHERE id=?").run(id);
+  const prof = await (await f(OP + `/users/${id}`, {}, 'o')).text();
+  ok(/temp auto end/.test(prof) && /auto resume/.test(prof) && prof.includes('🇧🇩'), 'profile: plan history + flag');
+  const act = await (await f(OP + '/activity', {}, 'o')).text();
+  ok(/<span class="flag"/.test(act), 'activity log uses flags');
+  srv.close(); console.log(`ALL ${pass} PLAN CHECKS PASSED`); process.exit(0);
+})().catch(e => { console.error('FAIL', e); process.exit(1); });

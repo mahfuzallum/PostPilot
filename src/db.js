@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY, user_id INTEGER, tex
 
 // lightweight migrations
 for (const col of ["disabled INTEGER DEFAULT 0", "ban_reason TEXT", "display_name TEXT", "def_smode TEXT DEFAULT 'exact'", "def_disclosure INTEGER DEFAULT 1",
-  "notify_fail INTEGER DEFAULT 1", "notify_renew INTEGER DEFAULT 1", "last_login INTEGER", "last_ip TEXT", "last_country TEXT", "last_seen INTEGER", "push_enabled INTEGER DEFAULT 1", "tz TEXT", "openai_key_enc TEXT", "plan_start INTEGER", "email_post_deleted INTEGER DEFAULT 1", "email_expiry INTEGER DEFAULT 1", "email_payment INTEGER DEFAULT 1", "expired_mailed INTEGER", "reminded_until INTEGER", "tz_auto INTEGER"])
+  "notify_fail INTEGER DEFAULT 1", "notify_renew INTEGER DEFAULT 1", "last_login INTEGER", "last_ip TEXT", "last_country TEXT", "last_seen INTEGER", "push_enabled INTEGER DEFAULT 1", "tz TEXT", "openai_key_enc TEXT", "plan_start INTEGER", "email_post_deleted INTEGER DEFAULT 1", "email_expiry INTEGER DEFAULT 1", "email_payment INTEGER DEFAULT 1", "expired_mailed INTEGER", "reminded_until INTEGER", "tz_auto INTEGER", "paused_at INTEGER", "paused_until INTEGER", "pause_extend INTEGER", "temp_until INTEGER", "temp_from INTEGER"])
   try { db.exec('ALTER TABLE users ADD COLUMN ' + col); } catch (e) { /* already there */ }
 db.exec(`
 CREATE TABLE IF NOT EXISTS login_events (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT DEFAULT 'login', ts INTEGER NOT NULL, ip TEXT, country TEXT, ua TEXT);

@@ -107,6 +107,7 @@ let running = false;
 async function tick(now = Date.now()) {
   if (running) return; running = true;
   try {
+    try { require('./payments').planHousekeeping(now); } catch (e) { log('plan housekeeping: ' + e.message); }
     // posts never attempted and >15min late (server was down) => missed
     db.prepare("UPDATE posts SET status='missed', error='Server was offline at scheduled time (>15 min late)' WHERE status='scheduled' AND attempts=0 AND scheduled_at < ? AND user_id NOT IN (SELECT id FROM users WHERE COALESCE(push_enabled,1)=0 OR COALESCE(disabled,0)=1)").run(now - LATE_MS);
     // stale locks (crash mid-post): don't risk double posting -> mark for review

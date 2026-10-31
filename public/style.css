@@ -304,3 +304,4 @@ body.modal-open{overflow:hidden}
  .nav.app-nav .links{display:none;width:100%;flex-direction:column;margin:0 0 12px}.nav.app-nav.open .links{display:flex}.nav.app-nav .links a{padding:12px;font-size:1rem}.nav.app-nav .links a.nav-upgrade{margin:6px 0 0;text-align:center}}
 .price .pill{display:inline-block;width:auto;align-self:flex-start}
 .savebar[hidden]{display:none!important}
+.na-box{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;margin:4px 0 12px;border-radius:12px;background:color-mix(in srgb,var(--card) 70%,transparent);border:1px dashed var(--line,#3a3a4a)}.na-box p{margin:4px 0 0}.na-ico{font-size:1.2rem;line-height:1.4}

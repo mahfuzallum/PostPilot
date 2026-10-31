@@ -125,7 +125,7 @@ async function main() {
   console.log('Connect buttons driven by env');
   const acB = await (await f('/connect', {}, 'b')).text();
   ok(!/client.?secret|client id|app secret|access token|paste|admin/i.test(acB) && !/<input[^>]+(token|secret)/i.test(acB), 'Accounts page: no credential fields, no admin wording');
-  ok(/<button class="btn" disabled>Connect<\/button> <span class="pill">Not available yet<\/span>/.test(acB) && !acB.includes('/oauth/reddit/start') && !/Coming soon/.test(acB), 'Reddit without env vars: disabled + Not available yet');
+  ok(/The site owner hasn't enabled Reddit yet/.test(acB) && /<button class="btn ghost sm" disabled[^>]*>Connect Reddit<\/button>/.test(acB) && !acB.includes('/oauth/reddit/start') && !/Coming soon/.test(acB), 'Reddit without env vars: disabled + Not available yet');
   ok(!acB.slice(acB.indexOf('data-platform="reddit"')).includes('publishing</span>') && /data-platform="threads"[^]*?publishing/.test(acB), 'publishing badge only on configured platforms');
   ok(/href="\/oauth\/threads\/start"/.test(acB) && /href="\/oauth\/x\/start"/.test(acB), 'Threads + X with env vars: Connect enabled');
   ok((await f('/oauth/reddit/start', {}, 'b')).headers.get('location') === '/connect', 'Connect for unconfigured platform refused');

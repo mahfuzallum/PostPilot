@@ -11,6 +11,7 @@ const { db, DATA_DIR } = require('./db');
 const S = require('./settings');
 const P = require('./payments');
 const { h } = require('./views');
+const { flagLabel } = require('./flags');
 const { sessionSecret } = require('./crypto');
 const { audit } = require('./audit');
 const mailer = require('./mailer');
@@ -94,7 +95,12 @@ ${nav ? `<aside class="op-side"><div class="op-brand"><i></i><div><b>${h(S.get('
   const A = (req, action, target, detail) => audit(req, who(req), action, target, detail);
   const ago = ms => { if (!ms) return '–'; const d = Date.now() - ms; return d < 60e3 ? 'just now' : d < 3600e3 ? Math.floor(d / 60e3) + 'm ago' : d < 864e5 ? Math.floor(d / 3600e3) + 'h ago' : Math.floor(d / 864e5) + 'd ago'; };
   const usd = n => '$' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
-  const flag = c => c && /^[A-Z]{2}$/.test(c) ? String.fromCodePoint(...[...c].map(x => 127397 + x.charCodeAt(0))) + ' ' + c : h(c || 'Unknown');
+  const flag = c => flagLabel(c);
+  const short = ms => new Date(ms).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: S.get('default_tz') || 'UTC' });
+  const dIn = ms => ms ? new Date(ms).toISOString().slice(0, 10) : '';
+  const paidActive = u => u.plan !== 'free' && (u.plan_until || 0) > Date.now();
+  // Extra status badges for temporary control (shown under the plan badge).
+  const tempBadges = u => `${P.isPaused(u) ? `<span class="badge warn" title="Premium is off while paused">⏸ Paused ${u.paused_until ? 'until ' + short(u.paused_until) : 'indefinitely'}</span>` : ''}${P.hasTemp(u) ? `<span class="badge info" title="Premium is on temporarily, then reverts automatically">⏱ Temporary until ${short(u.temp_until)}</span>` : ''}`;
   const av = e => `<span class="av" style="--hue:${[...String(e)].reduce((a, c) => a + c.charCodeAt(0), 0) % 360}">${h(String(e || '?')[0].toUpperCase())}</span>`;
   const countdown = u => P.isPremium(u) ? `<span class="cd" data-until="${u.plan_until}">${fmt(u.plan_until)}</span>` : (u.plan !== 'free' && u.plan_until ? '<span class="cd exp">Expired</span>' : '<span class="muted small">Free</span>');
   const platsOf = id => db.prepare('SELECT platform, COUNT(*) n FROM accounts WHERE user_id=? GROUP BY platform').all(id);
@@ -145,7 +151,7 @@ ${nav ? `<aside class="op-side"><div class="op-brand"><i></i><div><b>${h(S.get('
     return `<section class="panel" id="plan-requests"><div class="ph"><h2>Plan requests</h2><span class="small muted">${list.length} pending</span></div>
       <p class="small muted">Users who clicked "Choose plan" while online payment is off. Open the user and grant the plan after they pay you.</p>
       <div class="tbl"><table><thead><tr><th>User</th><th>Plan</th><th>Amount</th><th>Requested</th><th></th></tr></thead><tbody>
-      ${list.map(i => `<tr><td><a href="${base}/users/${i.user_id}">${h(i.email)}</a></td><td>${h((P.PLANS[i.plan] || {}).label || i.plan)}</td><td>${usd(i.amount)}</td><td>${fmt(i.created)}</td><td class="row-act"><a class="btn sm" href="${base}/users/${i.user_id}">Grant…</a><form method="post" action="${base}/intents/${i.id}/dismiss"><button class="btn ghost sm">Dismiss</button></form></td></tr>`).join('') || '<tr><td colspan="5" class="muted">No pending requests</td></tr>'}</tbody></table></div></section>`;
+      ${list.map(i => `<tr><td><a href="${base}/users/${i.user_id}">${h(i.email)}</a></td><td>${h((P.PLANS[i.plan] || {}).label || i.plan)}</td><td>${usd(i.amount)}</td><td>${fmt(i.created)}</td><td class="row-act"><a class="btn sm" href="${base}/users/${i.user_id}/plan" data-modal>Grant…</a><form method="post" action="${base}/intents/${i.id}/dismiss"><button class="btn ghost sm">Dismiss</button></form></td></tr>`).join('') || '<tr><td colspan="5" class="muted">No pending requests</td></tr>'}</tbody></table></div></section>`;
   }
   r.post('/intents/:id/dismiss', (req, res) => { P.resolveIntent(Number(req.params.id), 'dismissed'); A(req, 'billing.intent_dismissed', null, req.params.id); res.redirect(base + '#plan-requests'); });
 
@@ -190,43 +196,82 @@ ${nav ? `<aside class="op-side"><div class="op-brand"><i></i><div><b>${h(S.get('
     res.send(page('Owner · Top posts', `<p class="muted">Top-performing posts across all accounts, ranked by views + likes + replies. Users run live X / Reddit / Threads competitor searches from their Competitors page.</p>${blocks}`, true, '/competitors'));
   });
 
-  r.get('/users', (req, res) => {
-    const q = String(req.query.q || '').trim(), f = String(req.query.f || '');
-    const w = [], a = [];
-    if (q) { w.push('(u.email LIKE ? OR u.last_ip LIKE ? OR u.last_country LIKE ?)'); a.push(`%${q}%`, `%${q}%`, `%${q}%`); }
-    if (f === 'premium') { w.push("u.plan!='free' AND u.plan_until>?"); a.push(Date.now()); }
+  // Users: search, filter, sort, paginate (25/page), stats, CSV. Table on desktop, cards on narrow screens (CSS only).
+  const userQuery = req => {
+    const q = String(req.query.q || '').trim().slice(0, 100), f = ['premium', 'free', 'banned', 'expiring', 'paused'].includes(req.query.f) ? req.query.f : '';
+    const now = Date.now(), w = [], a = [];
+    if (q) { w.push('(u.email LIKE ? OR u.display_name LIKE ? OR u.last_ip LIKE ? OR u.last_country LIKE ?)'); a.push(...Array(4).fill(`%${q}%`)); }
+    if (f === 'premium') w.push(P.premiumSQL(now));
+    if (f === 'free') w.push('NOT ' + P.premiumSQL(now));
+    if (f === 'paused') w.push('u.paused_at IS NOT NULL');
     if (f === 'banned') w.push('u.disabled=1');
-    if (f === 'expiring') { w.push("u.plan!='free' AND u.plan_until BETWEEN ? AND ?"); a.push(Date.now(), Date.now() + 7 * 864e5); }
-    const list = db.prepare(`SELECT u.* FROM users u ${w.length ? 'WHERE ' + w.join(' AND ') : ''} ORDER BY u.id DESC LIMIT 500`).all(...a);
-    const planOpts = Object.entries(P.PLANS).map(([k, p]) => `<option value="${k}" data-usd="${p.usd}">${p.label} · $${p.usd}</option>`).join('');
+    if (f === 'expiring') { w.push("u.plan!='free' AND u.plan_until BETWEEN ? AND ?"); a.push(now, now + 7 * 864e5); }
+    return { q, f, where: w.length ? 'WHERE ' + w.join(' AND ') : '', args: a };
+  };
+  const SORTS = { user: 'lower(u.email)', plan: "(CASE WHEN {prem} THEN 1 ELSE 0 END)", expires: 'COALESCE(u.plan_until,0)', location: "COALESCE(u.last_country,'')", active: 'COALESCE(u.last_seen,0)', joined: 'u.created', status: 'u.disabled' };
+  r.get('/users', (req, res) => {
+    const { q, f, where, args } = userQuery(req), now = Date.now(), per = 25;
+    const sort = SORTS[req.query.sort] ? req.query.sort : 'joined', dir = req.query.dir === 'asc' ? 'ASC' : 'DESC';
+    const total = db.prepare(`SELECT COUNT(*) n FROM users u ${where}`).get(...args).n, pages = Math.max(1, Math.ceil(total / per)), pg = Math.min(pages, Math.max(1, Number(req.query.page) || 1));
+    const list = db.prepare(`SELECT u.* FROM users u ${where} ORDER BY ${SORTS[sort].replace('{prem}', P.premiumSQL(now))} ${dir}, u.id DESC LIMIT ? OFFSET ?`).all(...args, per, (pg - 1) * per);
+    const st = db.prepare(`SELECT COUNT(*) total, SUM(last_seen>?) today, SUM(${P.premiumSQL(now)}) prem, SUM(disabled=1) banned, SUM(plan!='free' AND plan_until BETWEEN ? AND ?) exp, SUM(paused_at IS NOT NULL) paused FROM users u`).get(now - 864e5, now, now + 7 * 864e5);
+    const qs = o => { const p = new URLSearchParams({ q, f, sort, dir: dir.toLowerCase(), page: pg, ...o }); for (const [k, v] of [...p]) if (!v || (k === 'page' && v === '1')) p.delete(k); const s = p.toString(); return `${base}/users${s ? '?' + s : ''}`; };
+    const th = (key, label) => { const on = sort === key, nd = on && dir === 'DESC' ? 'asc' : 'desc'; return `<th aria-sort="${on ? (dir === 'ASC' ? 'ascending' : 'descending') : 'none'}"><a class="sort${on ? ' on' : ''}" href="${qs({ sort: key, dir: nd, page: 1 })}">${label}<i>${on ? (dir === 'ASC' ? '▲' : '▼') : '↕'}</i></a></th>`; };
+    const chips = [['', 'All', st.total], ['premium', 'Premium', st.prem || 0], ['free', 'Free', (st.total || 0) - (st.prem || 0)], ['banned', 'Banned', st.banned || 0], ['expiring', 'Expiring soon', st.exp || 0], ['paused', 'Paused', st.paused || 0]];
+    const row = u => { const prem = P.isPremium(u), name = u.display_name ? h(u.display_name) : h(u.email.split('@')[0]);
+      return `<tr class="${u.disabled ? 'is-banned' : ''}">
+      <td data-label="User"><a class="who" href="${base}/users/${u.id}">${av(u.display_name || u.email)}<span><b>${name}</b><small>${h(u.email)}</small><small>Joined ${fmt(u.created).split(',')[0]} · #${u.id}</small></span></a></td>
+      <td data-label="Plan"><a class="plan-open" href="${base}/users/${u.id}/plan" data-modal title="Manage plan for ${h(u.email)}">${paidActive(u) ? `<span class="badge pri">★ ${h(planLabel(u.plan))}</span>` : P.hasTemp(u) ? '<span class="badge pri">★ Premium</span>' : '<span class="badge">Free</span>'}<span class="pen" aria-hidden="true">✎</span></a>${tempBadges(u) ? `<div class="u-sub u-badges">${tempBadges(u)}</div>` : ''}${prem && paidActive(u) ? `<div class="u-sub">${countdown(u)}</div>` : !prem && !P.isPaused(u) && u.plan !== 'free' && u.plan_until ? '<div class="u-sub"><span class="cd exp">Plan expired</span></div>' : ''}</td>
+      <td data-label="Location"><span class="loc">${flag(u.last_country)}</span><div class="u-sub mono">${h(u.last_ip || '–')}</div></td>
+      <td data-label="Last active"><span title="${fmt(u.last_seen)}">${ago(u.last_seen)}</span><div class="u-sub">${platChips(u.id)}</div></td>
+      <td data-label="Password"><span class="mask" title="Stored hashed (bcrypt). It can never be shown.">••••••••</span></td>
+      <td data-label="Status">${u.disabled ? `<span class="badge bad" title="${h(u.ban_reason || '')}">Banned</span>${u.ban_reason ? `<div class="u-sub clip" title="${h(u.ban_reason)}">${h(u.ban_reason)}</div>` : ''}` : '<span class="badge ok">Active</span>'}</td>
+      <td data-label="Push"><form method="post" action="${base}/users/${u.id}/push"><button class="switch ${u.push_enabled === 0 ? '' : 'on'}" title="Automatic posting ${u.push_enabled === 0 ? 'off' : 'on'}" aria-label="Automatic posting for ${h(u.email)}" aria-pressed="${u.push_enabled !== 0}"><i></i></button></form></td>
+      <td data-label="Actions" class="acts"><details class="pop"><summary class="btn ghost sm" aria-label="Actions for ${h(u.email)}">Manage ▾</summary><div class="popc">
+        <a class="menu-link" href="${base}/users/${u.id}">👤 View profile &amp; history</a><a class="menu-link" href="${base}/activity?q=${encodeURIComponent(u.email)}">📈 View activity</a>
+        <div class="menu-h">Plan</div>
+        <a class="menu-link" href="${base}/users/${u.id}/plan" data-modal>⭐ ${paidActive(u) ? 'Change plan / expiry' : 'Grant plan'}…</a>
+        ${P.isPaused(u) ? `<form method="post" action="${base}/users/${u.id}/resume"><button class="menu-link">▶ Resume plan now</button></form>` : `<a class="menu-link" href="${base}/users/${u.id}/plan?tab=pause" data-modal>⏸ Pause plan…</a>`}
+        ${P.hasTemp(u) ? `<form method="post" action="${base}/users/${u.id}/temp-end" data-confirm="End temporary Premium for ${h(u.email)} now?"><button class="menu-link">⏹ End temporary Premium</button></form>` : `<a class="menu-link" href="${base}/users/${u.id}/plan?tab=temp" data-modal>⏱ Temporary Premium…</a>`}
+        ${paidActive(u) ? `<form method="post" action="${base}/users/${u.id}/revoke" data-confirm="Revoke Premium for ${h(u.email)}?"><button class="menu-link danger">✕ Revoke plan</button></form>` : ''}
+        <div class="menu-h">${u.disabled ? 'Unban' : 'Ban'}</div>
+        <form method="post" action="${base}/users/${u.id}/${u.disabled ? 'unban' : 'ban'}"><input name="reason" maxlength="300" placeholder="${u.disabled ? 'Reason for unbanning (optional)' : 'Reason for banning'}" ${u.disabled ? '' : 'required'}><button class="btn ${u.disabled ? 'ghost' : 'danger'} sm" style="width:100%;margin-top:8px">${u.disabled ? 'Unban user' : 'Ban user'}</button></form>
+      </div></details></td></tr>`; };
+    const pager = pages > 1 ? `<nav class="pager" aria-label="Pages">${pg > 1 ? `<a class="btn ghost sm" href="${qs({ page: pg - 1 })}">← Prev</a>` : '<span class="btn ghost sm" aria-disabled="true">← Prev</span>'}<span class="muted small">Page ${pg} of ${pages}</span>${pg < pages ? `<a class="btn ghost sm" href="${qs({ page: pg + 1 })}">Next →</a>` : '<span class="btn ghost sm" aria-disabled="true">Next →</span>'}</nav>` : '';
     res.send(page('Owner · Users', `${msg(req)}
-    <form class="filters" method="get" action="${base}/users"><input name="q" value="${h(q)}" placeholder="Search email, IP or country"><select name="f">${[['', 'All users'], ['premium', 'Premium'], ['expiring', 'Expiring ≤ 7d'], ['banned', 'Banned']].map(([v, l]) => `<option value="${v}" ${f === v ? 'selected' : ''}>${l}</option>`).join('')}</select><button class="btn sm">Filter</button></form>
-    <section class="panel"><div class="tbl"><table class="users"><thead><tr><th>User</th><th>Password</th><th>Subscription</th><th>Expires in</th><th>Country</th><th>Last IP</th><th>Registered</th><th>Last active</th><th>Push</th><th>Status</th><th>Actions</th></tr></thead><tbody>
-    ${list.map(u => `<tr class="${u.disabled ? 'is-banned' : ''}"><td><a class="who" href="${base}/users/${u.id}">${av(u.email)}<span>${h(u.email)}<small>#${u.id} · ${platChips(u.id)}</small></span></a></td>
-      <td><span class="mask" title="Stored hashed (bcrypt). It can never be shown.">••••••••</span></td>
-      <td>${P.isPremium(u) ? `<span class="badge pri">${h(P.PLANS[u.plan] ? P.PLANS[u.plan].label : u.plan)}</span><small class="muted d">${h(u.plan_source || '')}</small>` : '<span class="badge">Free</span>'}</td>
-      <td>${countdown(u)}</td><td>${flag(u.last_country)}</td><td class="mono">${h(u.last_ip || '–')}</td><td>${fmt(u.created).split(',')[0]}</td><td>${ago(u.last_seen)}</td>
-      <td><form method="post" action="${base}/users/${u.id}/push"><button class="switch ${u.push_enabled === 0 ? '' : 'on'}" title="Automatic posting ${u.push_enabled === 0 ? 'off' : 'on'}" aria-pressed="${u.push_enabled !== 0}"><i></i></button></form></td>
-      <td>${u.disabled ? `<span class="badge bad" title="${h(u.ban_reason || '')}">Banned</span>` : '<span class="badge ok">Active</span>'}</td>
-      <td class="acts"><details class="pop"><summary class="btn ghost sm">Plan ▾</summary><div class="popc">
-        <form method="post" action="${base}/users/${u.id}/grant"><label>Plan</label><select name="plan" data-amount-src>${planOpts}</select>
-        <div class="two"><div><label>Amount (USD)</label><input name="amount" type="number" step="0.01" min="0" placeholder="list price"></div><div><label>Source</label><select name="source">${P.SOURCES.map(s => `<option>${s}</option>`).join('')}</select></div></div>
-        <label>Start date <span class="muted small">(optional)</span></label><input name="start" type="date">
-        <p class="hint">Blank start = extends from the current expiry if Premium is active, otherwise from today.</p><button class="btn sm" style="width:100%">Grant premium</button></form>
-        ${P.isPremium(u) ? `<form method="post" action="${base}/users/${u.id}/revoke" data-confirm="Revoke Premium for ${h(u.email)}?"><button class="btn danger sm" style="width:100%;margin-top:8px">Revoke premium</button></form>` : ''}</div></details>
-        <form method="post" action="${base}/users/${u.id}/${u.disabled ? 'unban' : 'ban'}" ${u.disabled ? '' : 'data-reason="Reason for banning ' + h(u.email) + '?"'}><input type="hidden" name="reason"><button class="btn ${u.disabled ? 'ghost' : 'danger'} sm">${u.disabled ? 'Unban' : 'Ban'}</button></form></td></tr>`).join('') || '<tr><td colspan="11" class="muted">No users match</td></tr>'}</tbody></table></div></section>
+    <div class="stat-chips"><div class="schip"><span>Total users</span><b>${st.total || 0}</b></div><div class="schip ok"><span>Active today</span><b>${st.today || 0}</b></div><div class="schip pri"><span>Premium</span><b>${st.prem || 0}</b></div><div class="schip bad"><span>Banned</span><b>${st.banned || 0}</b></div></div>
+    <section class="panel users-panel">
+    <div class="u-tools"><form class="u-search" method="get" action="${base}/users" role="search"><input type="hidden" name="f" value="${h(f)}"><input type="hidden" name="sort" value="${sort}"><input type="hidden" name="dir" value="${dir.toLowerCase()}"><input type="search" name="q" value="${h(q)}" placeholder="Search name, email, IP or country" aria-label="Search users"><button class="btn sm">Search</button>${q ? `<a class="btn ghost sm" href="${qs({ q: '', page: 1 })}">Clear</a>` : ''}</form>
+     <a class="btn ghost sm" href="${base}/users.csv?${new URLSearchParams({ q, f }).toString()}">⬇ Export CSV</a></div>
+    <div class="u-seg" role="tablist" aria-label="Filter users">${chips.map(([v, l, n]) => `<a role="tab" aria-selected="${f === v}" class="${f === v ? 'on' : ''}" href="${qs({ f: v, page: 1 })}">${l}<em>${n}</em></a>`).join('')}</div>
+    <p class="small muted u-count">${total ? `Showing ${(pg - 1) * per + 1}–${Math.min(total, pg * per)} of ${total}` : 'No users'}${q ? ` matching “${h(q)}”` : ''}</p>
+    <div class="tbl utbl"><table class="users"><thead><tr>${th('user', 'User')}${th('plan', 'Plan')}${th('location', 'Location')}${th('active', 'Last active')}<th>Password</th>${th('status', 'Status')}<th>Push</th><th><span class="sr">Actions</span></th></tr></thead><tbody>
+    ${list.map(row).join('') || '<tr><td colspan="8" class="muted empty">No users match these filters.</td></tr>'}</tbody></table></div>${pager}</section>
     <p class="small muted">Push off = the worker skips this user's scheduled posts (they stay in the queue). Passwords are bcrypt hashes and are never displayed.</p>`, true, '/users'));
   });
+  r.get('/users.csv', (req, res) => {
+    const { where, args } = userQuery(req), esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`, iso = ms => ms ? new Date(ms).toISOString() : '';
+    const rows = db.prepare(`SELECT u.* FROM users u ${where} ORDER BY u.id`).all(...args);
+    A(req, 'users.export', null, rows.length + ' rows');
+    res.type('text/csv').set('Content-Disposition', `attachment; filename="users-${new Date().toISOString().slice(0, 10)}.csv"`)
+      .send(['id,email,name,plan,premium,plan_until,country,last_ip,registered,last_active,status,ban_reason,push'].concat(rows.map(u => [u.id, u.email, u.display_name, u.plan, P.isPremium(u) ? 'yes' : 'no', iso(u.plan_until), u.last_country, u.last_ip, iso(u.created), iso(u.last_seen), u.disabled ? 'banned' : 'active', u.ban_reason, u.push_enabled === 0 ? 'off' : 'on'].map(esc).join(','))).join('\n'));
+  });
+  const profActs = u => `<div class="prof-acts"><h2 class="prof-name">${h(u.display_name || u.email)}</h2><details class="pop"><summary class="btn sm" aria-label="Actions for ${h(u.email)}">Actions ▾</summary><div class="popc">
+        <a class="menu-link" href="${base}/users/${u.id}/plan" data-modal data-act="plan">⭐ ${paidActive(u) ? 'Change plan / expiry' : 'Grant plan'}…</a>
+        ${P.isPaused(u) ? `<form method="post" action="${base}/users/${u.id}/resume"><button class="menu-link">▶ Resume plan now</button></form>` : `<a class="menu-link" href="${base}/users/${u.id}/plan?tab=pause" data-modal data-act="pause">⏸ Pause plan…</a>`}
+        ${P.hasTemp(u) ? `<form method="post" action="${base}/users/${u.id}/temp-end"><button class="menu-link">⏹ End temporary Premium</button></form>` : `<a class="menu-link" href="${base}/users/${u.id}/plan?tab=temp" data-modal data-act="temp">⏱ Temporary Premium…</a>`}
+        ${paidActive(u) ? `<form method="post" action="${base}/users/${u.id}/revoke" data-confirm="Revoke Premium for ${h(u.email)}?"><button class="menu-link danger">✕ Revoke plan</button></form>` : ''}
+      </div></details></div>`;
   r.get('/users/:id', (req, res, next) => {
     const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id); if (!u) return next('router');
     const bans = db.prepare('SELECT * FROM ban_log WHERE user_id=? ORDER BY ts DESC').all(u.id), plans = db.prepare('SELECT * FROM plan_log WHERE user_id=? ORDER BY ts DESC LIMIT 50').all(u.id);
     const pays = db.prepare('SELECT * FROM payments_ledger WHERE user_id=? ORDER BY ts DESC').all(u.id), subs = db.prepare('SELECT * FROM subscriptions WHERE user_id=? ORDER BY start_at DESC').all(u.id);
     const logins = db.prepare('SELECT * FROM login_events WHERE user_id=? ORDER BY ts DESC LIMIT 20').all(u.id), accs = db.prepare('SELECT platform,username,status FROM accounts WHERE user_id=?').all(u.id);
     const tbl = (head, rows, empty) => `<div class="tbl"><table><thead><tr>${head.map(x => `<th>${x}</th>`).join('')}</tr></thead><tbody>${rows.join('') || `<tr><td colspan="${head.length}" class="muted">${empty}</td></tr>`}</tbody></table></div>`;
-    res.send(page('Owner · ' + u.email, `${msg(req)}<div class="kpis">${card('Subscription', P.isPremium(u) ? h(P.PLANS[u.plan] ? P.PLANS[u.plan].label : u.plan) : 'Free', countdown(u), P.isPremium(u) ? 'pri' : '')}${card('Paid total', usd(pays.reduce((a, p) => a + p.amount, 0)), pays.length + ' payments')}${card('Last login', ago(u.last_login), flag(u.last_country) + ' · ' + h(u.last_ip || ''))}${card('Status', u.disabled ? 'Banned' : 'Active', h(u.ban_reason || ''), u.disabled ? 'bad' : 'ok')}</div>
+    res.send(page('Owner · ' + u.email, `${msg(req)}${profActs(u)}<div class="kpis">${card('Subscription', P.isPaused(u) ? 'Paused' : P.isPremium(u) ? h(paidActive(u) ? planLabel(u.plan) : 'Temporary') : 'Free', (tempBadges(u) || countdown(u)) + ` <a class="btn ghost sm" href="${base}/users/${u.id}/plan" data-modal>Manage plan</a>`, P.isPremium(u) ? 'pri' : P.isPaused(u) ? 'warn' : '')}${card('Paid total', usd(pays.reduce((a, p) => a + p.amount, 0)), pays.length + ' payments')}${card('Last login', ago(u.last_login), flag(u.last_country) + ' · ' + h(u.last_ip || ''))}${card('Status', u.disabled ? 'Banned' : 'Active', h(u.ban_reason || ''), u.disabled ? 'bad' : 'ok')}</div>
     <div class="grid2"><section class="panel"><div class="ph"><h2>Subscriptions</h2></div>${tbl(['Plan', 'Start', 'End', 'Amount', 'Source', 'Status'], subs.map(s => `<tr><td>${h(s.plan)}</td><td>${fmt(s.start_at)}</td><td>${fmt(s.end_at)}</td><td>${usd(s.amount)}</td><td>${h(s.source)}</td><td><span class="badge ${s.status === 'active' ? 'ok' : ''}">${h(s.status)}</span></td></tr>`), 'No subscriptions')}</section>
     <section class="panel"><div class="ph"><h2>Ban history</h2></div>${tbl(['When', 'Action', 'Reason', 'By'], bans.map(b => `<tr><td>${fmt(b.ts)}</td><td><span class="badge ${b.action === 'ban' ? 'bad' : 'ok'}">${b.action}</span></td><td>${h(b.reason || '–')}</td><td>${h(b.by || '')}</td></tr>`), 'Never banned')}</section></div>
-    <div class="grid2"><section class="panel"><div class="ph"><h2>Plan history</h2></div>${tbl(['When', 'Action', 'Detail', 'By'], plans.map(p => `<tr><td>${fmt(p.ts)}</td><td>${h(p.action)} ${h(p.plan || '')}</td><td>${h(p.detail || '')}</td><td>${h(p.by || '')}</td></tr>`), 'No changes')}</section>
+    <div class="grid2"><section class="panel"><div class="ph"><h2>Plan history</h2></div>${tbl(['When', 'Action', 'Detail', 'By'], plans.map(p => `<tr><td>${fmt(p.ts)}</td><td><span class="badge ${/pause/.test(p.action) ? 'warn' : /temp/.test(p.action) ? 'info' : /resume|grant/.test(p.action) ? 'ok' : /revoke/.test(p.action) ? 'bad' : ''}">${h(p.action.replace(/_/g, ' '))}</span> ${h(p.plan || '')}</td><td>${h(p.detail || '')}</td><td>${h(p.by || '')}</td></tr>`), 'No changes')}</section>
     <section class="panel"><div class="ph"><h2>Recent logins</h2></div>${tbl(['When', 'IP', 'Country', 'Device'], logins.map(l => `<tr><td>${fmt(l.ts)}</td><td class="mono">${h(l.ip)}</td><td>${flag(l.country)}</td><td>${h(l.ua)}</td></tr>`), 'No logins yet')}</section></div>
     <section class="panel"><div class="ph"><h2>Connected accounts</h2></div>${tbl(['Platform', 'Handle', 'Status'], accs.map(a => `<tr><td><span class="chip ${a.platform}">${a.platform}</span></td><td>@${h(a.username || '')}</td><td>${h(a.status || 'ok')}</td></tr>`), 'None')}</section>`, true, '/users'));
   });
@@ -244,6 +289,97 @@ ${nav ? `<aside class="op-side"><div class="op-brand"><i></i><div><b>${h(S.get('
     if (req.body.plan === 'free') { P.revoke(Number(req.params.id), who(req).name); A(req, 'plan.revoke', 'user#' + req.params.id); }
     else if (P.PLANS[req.body.plan]) { P.recordPayment({ userId: Number(req.params.id), plan: req.body.plan, source: 'manual', by: who(req).name }); A(req, 'plan.grant', 'user#' + req.params.id, req.body.plan); }
     back(req, res, 'Plan updated');
+  });
+  // ---- Plan modal: one panel for plan, dates, pause/resume and temporary premium ----
+  const planLabel = k => k === 'custom' ? 'Custom' : P.PLANS[k] ? P.PLANS[k].label : k;
+  const DAY = 864e5, parseDay = v => { const t = Date.parse(String(v || '') + 'T00:00:00Z'); return isNaN(t) ? null : t; };
+  const planPanel = (u, tab) => {
+    const prem = P.isPremium(u), paid = paidActive(u), cur = P.PLANS[u.plan] || u.plan === 'custom' ? u.plan : 'monthly';
+    const startDef = paid ? u.plan_until : Date.now(), endDef = startDef + (P.PLANS[cur] || P.PLANS.monthly).days * DAY;
+    const cards = [...Object.entries(P.PLANS).map(([k, p]) => [k, `$${p.usd}`, { monthly: 'Monthly', quarterly: '3 months', semiannual: '6 months', yearly: 'Yearly' }[k] || p.label, `${p.days} days`, p.days, p.usd]), ['custom', 'Custom', 'Any length', 'pick expiry', 0, '']];
+    const T = (id, l) => `<a role="tab" href="${base}/users/${u.id}/plan?tab=${id}" data-tab="${id}" class="${tab === id ? 'on' : ''}" aria-selected="${tab === id}">${l}</a>`;
+    const presets = (name, extra) => `<div class="pm-chips">${[1, 3, 7, 30].map((d, i) => `<label><input type="radio" name="${name}" value="${d}" ${i === 2 ? 'checked' : ''}><span>${d} day${d > 1 ? 's' : ''}</span></label>`).join('')}<label><input type="radio" name="${name}" value="date"><span>Until date</span></label>${extra || ''}</div>`;
+    return `<div class="pm" data-pm>
+    <header class="pm-h">${av(u.display_name || u.email)}<div class="pm-who"><b>${h(u.display_name || u.email.split('@')[0])}</b><small>${h(u.email)} · #${u.id} · ${flag(u.last_country)}</small></div>
+     <div class="pm-cur"><small>Current plan</small><div>${paid ? `<span class="badge pri">★ ${h(planLabel(u.plan))}</span>` : prem ? '<span class="badge pri">★ Premium</span>' : '<span class="badge">Free</span>'} ${tempBadges(u)}</div><small>${u.plan_until ? (paid ? 'Expires ' : 'Expired ') + fmt(u.plan_until) : 'No paid plan yet'}</small></div>
+     <a class="pm-x" href="${base}/users" data-close aria-label="Close">✕</a></header>
+    <nav class="pm-tabs" role="tablist">${T('plan', '⭐ Plan &amp; expiry')}${T('pause', P.isPaused(u) ? '▶ Resume' : '⏸ Pause')}${T('temp', '⏱ Temporary Premium')}</nav>
+    <section class="pm-pane" data-pane="plan" ${tab === 'plan' ? '' : 'hidden'}>
+     <form method="post" action="${base}/users/${u.id}/plan-save" data-plan-form>
+      <div class="pm-cards" role="radiogroup" aria-label="Plan">${cards.map(([k, price, name, sub, days, usdv]) => `<label class="pcard"><input type="radio" name="plan" value="${k}" data-days="${days}" data-usd="${usdv}" ${k === cur ? 'checked' : ''}><b>${price}</b><span>${name}</span><small>${sub}</small></label>`).join('')}</div>
+      <div class="pm-grid">
+       <div><label for="pm-s${u.id}">Start date</label><input id="pm-s${u.id}" type="date" name="start" value="${dIn(startDef)}" required></div>
+       <div><label for="pm-e${u.id}">Expiry date</label><input id="pm-e${u.id}" type="date" name="end" value="${dIn(endDef)}" required></div>
+       <div><label for="pm-a${u.id}">Amount (USD)</label><input id="pm-a${u.id}" type="number" step="0.01" min="0" name="amount" placeholder="$${(P.PLANS[cur] || { usd: 0 }).usd} list"></div>
+       <div><label for="pm-o${u.id}">Source</label><select id="pm-o${u.id}" name="source">${P.SOURCES.map(x => `<option>${x}</option>`).join('')}</select></div>
+       <div class="span2"><label for="pm-n${u.id}">Note <span class="muted small">(optional)</span></label><input id="pm-n${u.id}" name="note" maxlength="200" placeholder="e.g. paid via bKash, ref 123"></div>
+      </div>
+      <p class="hint" data-pm-hint>${paid ? 'Start defaults to the current expiry, so the new time is added on top.' : 'Start defaults to today.'} Expiry fills in from the plan; you can change it.</p>
+      <div class="pm-foot">${paid ? `<button class="btn danger sm" form="pm-rv${u.id}">Revoke plan</button>` : '<span></span>'}<span class="grow"></span><a class="btn ghost sm" href="${base}/users" data-close>Cancel</a><button class="btn sm">Save plan</button></div>
+     </form>${paid ? `<form id="pm-rv${u.id}" method="post" action="${base}/users/${u.id}/revoke" data-confirm="Revoke Premium for ${h(u.email)}?"></form>` : ''}
+    </section>
+    <section class="pm-pane" data-pane="pause" ${tab === 'pause' ? '' : 'hidden'}>
+     ${P.isPaused(u) ? `<div class="pm-state warn"><b>⏸ Paused ${u.paused_until ? 'until ' + fmt(u.paused_until) : 'indefinitely'}</b><p class="small muted">Premium is off. Since ${fmt(u.paused_at)}.${u.pause_extend ? ' Paused days will be added to the expiry on resume.' : ''} ${u.paused_until ? 'Resumes automatically.' : ''}</p></div>
+      <form method="post" action="${base}/users/${u.id}/resume" class="pm-foot"><span class="grow"></span><button class="btn sm">▶ Resume plan now</button></form>` : `
+     <form method="post" action="${base}/users/${u.id}/pause">
+      <p class="small muted" style="margin-top:0">Turns Premium <b>off</b> for a while without revoking it. It switches back on automatically when the pause ends. Separate from ban and push.</p>
+      <label>Pause for</label>${presets('dur', '<label><input type="radio" name="dur" value="forever"><span>Indefinitely</span></label>')}
+      <div class="pm-grid"><div><label for="pm-pu${u.id}">Until date <span class="muted small">(for “Until date”)</span></label><input id="pm-pu${u.id}" type="date" name="until" min="${dIn(Date.now() + DAY)}"></div>
+       <div class="pm-check"><label><input type="checkbox" name="extend" value="1" ${paid ? 'checked' : ''}> Extend expiry by the paused days</label></div></div>
+      <div class="pm-foot"><span class="grow"></span><a class="btn ghost sm" href="${base}/users" data-close>Cancel</a><button class="btn warn sm">⏸ Pause plan</button></div></form>`}
+    </section>
+    <section class="pm-pane" data-pane="temp" ${tab === 'temp' ? '' : 'hidden'}>
+     ${P.hasTemp(u) ? `<div class="pm-state info"><b>⏱ Temporary Premium until ${fmt(u.temp_until)}</b><p class="small muted">Reverts automatically. Their paid plan (if any) is untouched.</p></div>` : ''}
+     <form method="post" action="${base}/users/${u.id}/temp">
+      <p class="small muted" style="margin-top:0">Turns Premium <b>on</b> temporarily (trial, apology, testing). It reverts automatically; no payment is recorded.</p>
+      <label>${P.hasTemp(u) ? 'Change end' : 'Premium for'}</label>${presets('dur')}
+      <div class="pm-grid"><div><label for="pm-tu${u.id}">Until date</label><input id="pm-tu${u.id}" type="date" name="until" min="${dIn(Date.now() + DAY)}"></div></div>
+      <div class="pm-foot">${P.hasTemp(u) ? `<button class="btn danger sm" form="pm-te${u.id}">End now</button>` : ''}<span class="grow"></span><a class="btn ghost sm" href="${base}/users" data-close>Cancel</a><button class="btn sm">⏱ ${P.hasTemp(u) ? 'Update' : 'Turn on'} temporary Premium</button></div></form>
+     ${P.hasTemp(u) ? `<form id="pm-te${u.id}" method="post" action="${base}/users/${u.id}/temp-end"></form>` : ''}
+    </section></div>`;
+  };
+  const userOr404 = (req, next) => db.prepare('SELECT * FROM users WHERE id=?').get(Number(req.params.id));
+  r.get('/users/:id/plan', (req, res, next) => {
+    const u = userOr404(req); if (!u) return next('router');
+    const tab = ['plan', 'pause', 'temp'].includes(req.query.tab) ? req.query.tab : 'plan';
+    if (req.query.partial === '1') return res.send(planPanel(u, tab));
+    res.send(page('Owner · Plan for ' + u.email, `${msg(req)}<div class="pm-page">${planPanel(u, tab)}</div>`, true, '/users'));
+  });
+  const durUntil = (b, allowForever) => {
+    if (allowForever && b.dur === 'forever') return { until: null };
+    if (b.dur === 'date') { const t = parseDay(b.until); return t && t > Date.now() ? { until: t } : { err: 'Pick a future date' }; }
+    const d = Number(b.dur); return [1, 3, 7, 30].includes(d) || (d > 0 && d <= 3650) ? { until: Date.now() + d * DAY } : { err: 'Pick a period' };
+  };
+  r.post('/users/:id/plan-save', (req, res, next) => {
+    const u = userOr404(req), plan = String(req.body.plan || ''); if (!u || !(P.PLANS[plan] || plan === 'custom')) return next('router');
+    const start = parseDay(req.body.start) || Date.now(), end = parseDay(req.body.end);
+    if (plan === 'custom' && !end) return back(req, res, 'Custom plan needs an expiry date');
+    if (end && end <= start) return back(req, res, 'Expiry must be after the start date');
+    const r0 = P.recordPayment({ userId: u.id, plan, amount: req.body.amount, source: req.body.source || 'manual', startAt: start, endAt: end || undefined, note: String(req.body.note || '').trim().slice(0, 200) || null, by: who(req).name });
+    A(req, 'plan.grant', 'user#' + u.id, `${plan} ${dIn(r0.start)} → ${dIn(r0.end)}`);
+    back(req, res, `${planLabel(plan)} saved for ${u.email}: ${fmt(r0.start)} → ${fmt(r0.end)}`);
+  });
+  r.post('/users/:id/pause', (req, res, next) => {
+    const u = userOr404(req); if (!u) return next('router');
+    const d = durUntil(req.body, true); if (d.err) return back(req, res, d.err);
+    P.pause(u.id, { until: d.until, extend: req.body.extend === '1', by: who(req).name });
+    A(req, 'plan.pause', 'user#' + u.id, `${d.until ? 'until ' + dIn(d.until) : 'indefinitely'}${req.body.extend === '1' ? ' +extend' : ''}`);
+    back(req, res, `Plan paused for ${u.email} ${d.until ? 'until ' + fmt(d.until) : 'indefinitely'}`);
+  });
+  r.post('/users/:id/resume', (req, res, next) => {
+    const u = userOr404(req); if (!u) return next('router');
+    const out = P.resume(u.id, { by: who(req).name }); A(req, 'plan.resume', 'user#' + u.id, out ? `after ${Math.round(out.pausedMs / DAY * 10) / 10} days` : 'not paused');
+    back(req, res, out ? `Plan resumed for ${u.email}` : 'That plan was not paused');
+  });
+  r.post('/users/:id/temp', (req, res, next) => {
+    const u = userOr404(req); if (!u) return next('router');
+    const d = durUntil(req.body, false); if (d.err) return back(req, res, d.err);
+    P.grantTemp(u.id, { until: d.until, by: who(req).name }); A(req, 'plan.temp_on', 'user#' + u.id, 'until ' + dIn(d.until));
+    back(req, res, `Temporary Premium on for ${u.email} until ${fmt(d.until)}`);
+  });
+  r.post('/users/:id/temp-end', (req, res, next) => {
+    const u = userOr404(req); if (!u) return next('router');
+    P.endTemp(u.id, { by: who(req).name }); A(req, 'plan.temp_off', 'user#' + u.id); back(req, res, 'Temporary Premium ended');
   });
   const setBan = (req, res, ban) => {
     const id = Number(req.params.id), reason = String(req.body.reason || '').trim().slice(0, 300) || (ban ? 'No reason given' : null);

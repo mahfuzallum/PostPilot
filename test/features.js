@@ -83,6 +83,21 @@ async function main() {
   await f(`${OP}/users/${u2}/revoke`, { method: 'POST' }, 'o');
   ok(!P.isPremium(db.prepare('SELECT * FROM users WHERE id=?').get(u2)) && db.prepare("SELECT status FROM subscriptions WHERE user_id=?").get(u2).status === 'revoked' && db.prepare("SELECT 1 FROM plan_log WHERE user_id=? AND action='revoke'").get(u2), 'revoke ends Premium, logged in plan history');
 
+  console.log('Users page: search / filter / sort / pagination / CSV');
+  { const U = await (await f(OP + '/users', {}, 'o')).text();
+    ok(/class="stat-chips"/.test(U) && /Total users/.test(U) && /Active today/.test(U) && /Premium/.test(U) && /Banned/.test(U), 'users: summary stat chips');
+    ok(['All', 'Premium', 'Free', 'Banned', 'Expiring soon'].every(l => U.includes('>' + l + '<em>')), 'users: filter tabs All/Premium/Free/Banned/Expiring soon');
+    ok(/aria-sort=/.test(U) && U.includes('sort=user') && U.includes('sort=active') && /data-label="Location"/.test(U) && /Manage ▾/.test(U) && /View activity/.test(U), 'users: sortable headers, card labels, actions menu');
+    ok(!/<script(?![^>]*src=)/i.test(U) && !/\son[a-z]+="/i.test(U), 'users: no inline scripts');
+    const bn = await (await f(OP + '/users?f=banned', {}, 'o')).text(); ok(!bn.includes('user1@example.com'), 'users: banned filter excludes active users');
+    const sq = await (await f(OP + '/users?q=user1%40', {}, 'o')).text(); ok(sq.includes('user1@example.com') && !sq.includes('user2@example.com'), 'users: search');
+    for (let i = 0; i < 27; i++) db.prepare('INSERT INTO users(email,pw,created) VALUES(?,?,?)').run(`bulk${i}@example.com`, 'x', Date.now() - i * 1000);
+    const fr = await (await f(OP + '/users?f=free&q=bulk2', {}, 'o')).text(); ok(fr.includes('bulk2@example.com'), 'users: free filter');
+    const p1 = await (await f(OP + '/users?sort=user&dir=asc', {}, 'o')).text(); ok((p1.match(/<tr class="/g) || []).length === 25 && /Page 1 of \d/.test(p1) && p1.indexOf('bulk0@') < p1.indexOf('bulk1@'), 'users: 25 per page + sort by user');
+    const p2 = await (await f(OP + '/users?sort=user&dir=asc&page=2', {}, 'o')).text(); ok(/Page 2 of/.test(p2) && !p2.includes('bulk0@'), 'users: page 2');
+    const csv = await f(OP + '/users.csv?f=free', {}, 'o'); const ct = await csv.text(); ok(/text\/csv/.test(csv.headers.get('content-type')) && ct.startsWith('id,email,name,plan') && ct.includes('bulk3@example.com') && !/\$2[aby]\$/.test(ct), 'users: CSV export (filtered, no hashes)');
+    ok((await f(OP + '/users.csv', {}, 'z')).status === 404, 'users CSV hidden when logged out');
+    db.prepare("DELETE FROM users WHERE email LIKE 'bulk%'").run(); }
   console.log('Ban with reason + history');
   await f(`${OP}/users/${u2}/ban`, form({ reason: 'Spam links' }), 'o');
   r = await f('/login', form({ email: 'user2@example.com', password: 'password123' }), 'b2');

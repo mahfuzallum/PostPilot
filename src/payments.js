@@ -35,19 +35,28 @@ const PLANS = {
 const SOURCES = ['manual', 'stripe', 'nowpayments', 'other'];
 const DAY = 864e5;
 
-const isPremium = u => !!u && u.plan !== 'free' && (u.plan_until || 0) > Date.now();
+// Pause = premium OFF for a while (paused_until NULL = indefinitely). Temporary premium = ON until temp_until,
+// independent of the paid plan. Both are time-based, so they take effect immediately; the worker's
+// planHousekeeping() clears them, extends expiry when asked, and writes the history entries.
+const isPaused = (u, now = Date.now()) => !!u && !!u.paused_at && (!u.paused_until || u.paused_until > now);
+const hasTemp = (u, now = Date.now()) => !!u && (u.temp_until || 0) > now;
+const isPremium = u => { const now = Date.now(); return !!u && !isPaused(u, now) && ((u.plan !== 'free' && (u.plan_until || 0) > now) || hasTemp(u, now)); };
+// Same rule in SQL for list filters / counts (alias u). now is a number, never user input.
+const premiumSQL = now => `(NOT (u.paused_at IS NOT NULL AND (u.paused_until IS NULL OR u.paused_until>${+now})) AND ((u.plan!='free' AND u.plan_until>${+now}) OR COALESCE(u.temp_until,0)>${+now}))`;
 const log = (userId, action, plan, detail, by) =>
   db.prepare('INSERT INTO plan_log(user_id,action,plan,detail,by,ts) VALUES(?,?,?,?,?,?)').run(userId, action, plan || null, detail || null, by || null, Date.now());
 
-const recordPayment = db.transaction(({ userId, plan, amount, currency = 'USD', source = 'manual', externalId = null, paidAt, startAt, note = null, by = null } = {}) => {
-  const p = PLANS[plan]; if (!p) throw new Error('Unknown plan: ' + plan);
+const CUSTOM = { usd: 0, days: 30, label: 'Custom', months: 1 };
+const recordPayment = db.transaction(({ userId, plan, amount, currency = 'USD', source = 'manual', externalId = null, paidAt, startAt, endAt, note = null, by = null } = {}) => {
+  const p = plan === 'custom' ? CUSTOM : PLANS[plan]; if (!p) throw new Error('Unknown plan: ' + plan);
+  if (plan === 'custom' && !endAt) throw new Error('Custom plan needs an expiry date');
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(userId); if (!u) throw new Error('Unknown user');
   if (externalId) { const ex = db.prepare('SELECT id FROM payments_ledger WHERE external_id=?').get(String(externalId)); if (ex) return { duplicate: true, ledgerId: ex.id }; }
   const now = paidAt || Date.now();
   const amt = amount == null || amount === '' || isNaN(Number(amount)) ? p.usd : Math.max(0, Math.round(Number(amount) * 100) / 100);
   const src = SOURCES.includes(source) ? source : 'other';
   const start = startAt || (isPremium(u) ? u.plan_until : now);
-  const end = start + p.days * DAY;
+  const end = endAt && endAt > start ? endAt : start + p.days * DAY;
   const lid = db.prepare('INSERT INTO payments_ledger(user_id,plan,amount,currency,source,external_id,note,ts) VALUES(?,?,?,?,?,?,?,?)')
     .run(userId, plan, amt, currency, src, externalId ? String(externalId) : null, note, now).lastInsertRowid;
   const sid = db.prepare("INSERT INTO subscriptions(user_id,plan,start_at,end_at,amount,source,status,ledger_id,created) VALUES(?,?,?,?,?,?,'active',?,?)")
@@ -61,7 +70,7 @@ const recordPayment = db.transaction(({ userId, plan, amount, currency = 'USD', 
 function revoke(userId, by, reason) {
   const now = Date.now();
   db.prepare("UPDATE subscriptions SET status='revoked', end_at=MIN(end_at, ?) WHERE user_id=? AND status='active' AND end_at>?").run(now, userId, now);
-  db.prepare("UPDATE users SET plan='free', plan_until=NULL, plan_start=NULL WHERE id=?").run(userId);
+  db.prepare("UPDATE users SET plan='free', plan_until=NULL, plan_start=NULL, paused_at=NULL, paused_until=NULL, pause_extend=NULL, temp_until=NULL, temp_from=NULL WHERE id=?").run(userId);
   log(userId, 'revoke', null, reason || null, by);
 }
 
@@ -112,7 +121,40 @@ const pendingIntent = userId => db.prepare("SELECT * FROM plan_intents WHERE use
 const pendingIntents = () => db.prepare("SELECT i.*, u.email FROM plan_intents i JOIN users u ON u.id=i.user_id WHERE i.status='pending' ORDER BY i.created DESC").all();
 const resolveIntent = (id, status) => db.prepare("UPDATE plan_intents SET status=?, resolved=? WHERE id=? AND status='pending'").run(status, Date.now(), id).changes;
 
-module.exports = { PLANS, SOURCES, isPremium, recordPayment, revoke, extend, stats, available, checkout, setProvider, recordIntent, pendingIntent, pendingIntents, resolveIntent };
+const day = ms => new Date(ms).toISOString().slice(0, 10);
+// until: ms timestamp, or null = indefinitely. extend: add the paused days to plan_until on resume.
+function pause(userId, { until = null, extend = false, by = null } = {}) {
+  const now = Date.now();
+  db.prepare('UPDATE users SET paused_at=?, paused_until=?, pause_extend=? WHERE id=?').run(now, until, extend ? 1 : 0, userId);
+  log(userId, 'pause', null, `${until ? 'until ' + day(until) : 'indefinitely'}${extend ? '; expiry extended on resume' : ''}`, by);
+}
+function resume(userId, { by = null, at = Date.now(), auto = false } = {}) {
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(userId); if (!u || !u.paused_at) return null;
+  const end = Math.min(at, u.paused_until || at), days = Math.max(0, end - u.paused_at);
+  let until = u.plan_until;
+  if (u.pause_extend && u.plan !== 'free' && u.plan_until) { until = u.plan_until + days; db.prepare("UPDATE subscriptions SET end_at=end_at+? WHERE user_id=? AND status='active' AND end_at=?").run(days, userId, u.plan_until); }
+  db.prepare('UPDATE users SET paused_at=NULL, paused_until=NULL, pause_extend=NULL, plan_until=? WHERE id=?').run(until, userId);
+  log(userId, auto ? 'auto_resume' : 'resume', u.plan, `paused ${Math.round(days / DAY * 10) / 10} days${u.pause_extend && until !== u.plan_until ? '; expiry moved to ' + day(until) : ''}`, by || (auto ? 'system' : null));
+  return { until, pausedMs: days };
+}
+function grantTemp(userId, { until, by = null } = {}) {
+  if (!until || until <= Date.now()) throw new Error('Pick a future end date');
+  db.prepare('UPDATE users SET temp_until=?, temp_from=? WHERE id=?').run(until, Date.now(), userId);
+  log(userId, 'temp_on', null, 'temporary premium until ' + day(until), by);
+}
+function endTemp(userId, { by = null, auto = false } = {}) {
+  db.prepare('UPDATE users SET temp_until=NULL, temp_from=NULL WHERE id=?').run(userId);
+  log(userId, auto ? 'temp_auto_end' : 'temp_off', null, auto ? 'temporary premium ended' : 'temporary premium removed', by || (auto ? 'system' : null));
+}
+// Worker: resume finished pauses and end finished temporary grants. Returns what it did.
+function planHousekeeping(now = Date.now()) {
+  const done = { resumed: [], tempEnded: [] };
+  for (const u of db.prepare('SELECT id FROM users WHERE paused_at IS NOT NULL AND paused_until IS NOT NULL AND paused_until<=?').all(now)) { resume(u.id, { at: now, auto: true }); done.resumed.push(u.id); }
+  for (const u of db.prepare('SELECT id FROM users WHERE temp_until IS NOT NULL AND temp_until<=?').all(now)) { endTemp(u.id, { auto: true }); done.tempEnded.push(u.id); }
+  if (done.resumed.length || done.tempEnded.length) try { require('./audit').audit(null, { type: 'system', name: 'worker' }, 'plan.housekeeping', null, `resumed ${done.resumed.join(',') || '-'}; temp ended ${done.tempEnded.join(',') || '-'}`); } catch (e) { /* audit optional */ }
+  return done;
+}
+module.exports = { isPaused, hasTemp, premiumSQL, pause, resume, grantTemp, endTemp, planHousekeeping, CUSTOM, PLANS, SOURCES, isPremium, recordPayment, revoke, extend, stats, available, checkout, setProvider, recordIntent, pendingIntent, pendingIntents, resolveIntent };
 
 // Owner integration hook: call when a provider reports a failed charge. Emails the user (if opted in)
 // and records it in the plan history. details: { plan, amount, reason, externalId }
