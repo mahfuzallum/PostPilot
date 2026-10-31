@@ -1,0 +1,53 @@
+# PostPilot - Railway Variables (set once by the owner in Railway > service > Variables). End users never see these.
+# Leave a line blank/unset and that feature shows "Coming soon" on the website.
+
+# Threads (posting). From developers.facebook.com/apps > your app > Use cases > Threads API > Settings
+THREADS_APP_ID=
+# Threads app secret (same page as the App ID)
+THREADS_APP_SECRET=
+# Optional: "yes" only if Meta approved threads_keyword_search for your app
+THREADS_KEYWORD_SEARCH=
+
+# Reddit (posting + analytics). From reddit.com/prefs/apps > web app: the ID under the app name.
+# The app asks for scopes: identity read submit (duration=permanent). 'submit' is what allows posting.
+REDDIT_CLIENT_ID=
+# Reddit app secret
+REDDIT_CLIENT_SECRET=
+
+# X / Twitter (posting + analytics). developer.x.com > your app > OAuth 2.0 Client ID.
+# Scopes asked: tweet.read tweet.write users.read media.write offline.access.
+# Posting needs: User authentication settings = 'Read and write', and a project/API tier with write access.
+X_CLIENT_ID=
+# X OAuth 2.0 Client Secret (not the API Key)
+X_CLIENT_SECRET=
+
+# Optional: OpenAI key for the AI writer (platform.openai.com/api-keys)
+OPENAI_API_KEY=
+# Optional: Cloudinary for public media URLs (cloudinary.com dashboard)
+CLOUDINARY_CLOUD_NAME=
+CLOUDINARY_API_KEY=
+CLOUDINARY_API_SECRET=
+# Optional: Google Drive import (Google Cloud OAuth client, type Web application)
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+
+# Optional: public https address; auto-detected from RAILWAY_PUBLIC_DOMAIN if blank
+APP_URL=
+# Optional: secret path of the hidden owner admin page (8+ chars, e.g. /owner-k3j9x2mq7p). Blank = random path, printed in Deploy Logs
+ADMIN_PATH=
+# Optional: cookie signing secret. Blank = generated once and saved in /data
+SESSION_SECRET=
+# Optional: key that encrypts stored logins. Blank = generated once and saved in /data (never change it afterwards)
+ENCRYPTION_KEY=
+
+# Optional: email notifications (post deleted, Premium ending/expired, payment problems). Blank = emails are skipped and logged.
+# Gmail: SMTP_HOST=smtp.gmail.com, SMTP_PORT=587, SMTP_USER=you@gmail.com, SMTP_PASS=16-character App Password
+# (myaccount.google.com/apppasswords, needs 2-Step Verification). Gmail allows about 500 emails per day.
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASS=
+# Optional sender, e.g. "PostPilot <you@gmail.com>". Blank = SMTP_USER
+MAIL_FROM=
+# Optional: "off" disables the offline IP-to-country lookup (saves ~150 MB RAM; CF-IPCountry header still works)
+GEOIP_LOOKUP=
